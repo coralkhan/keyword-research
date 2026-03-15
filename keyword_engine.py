@@ -1,6 +1,7 @@
 import json
 import time
 import random
+import sys
 import argparse
 import requests
 import pandas as pd
@@ -9,16 +10,17 @@ from pytrends.request import TrendReq
 
 
 # ======================================
-# CONFIG
+# CONFIGURATION
 # ======================================
 
-TARGET_KEYWORDS = 80
-REQUEST_DELAY   = 1.2
-TREND_TIMEFRAME = "today 12-m"
-TRENDS_BATCH    = 5
-TRENDS_DELAY    = 20
-BACKOFF_BASE    = 60
-MAX_RETRIES     = 4
+TARGET_KEYWORDS  = 80
+REQUEST_DELAY    = 1.2
+TREND_TIMEFRAME  = "today 12-m"
+OUTPUT_TOP       = 20
+TRENDS_BATCH     = 5
+TRENDS_DELAY     = 20
+BACKOFF_BASE     = 60
+MAX_RETRIES      = 4
 
 HEADERS = {
     "User-Agent": (
@@ -27,6 +29,29 @@ HEADERS = {
         "Chrome/120.0.0.0 Safari/537.36"
     )
 }
+
+
+# ======================================
+# ARGUMENT PARSER
+# ======================================
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="Blog Keyword Engine")
+    parser.add_argument(
+        "--seed",
+        type=str,
+        required=False,
+        default=None,
+        help="Seed keyword to research (e.g. 'gaming phones')"
+    )
+    parser.add_argument(
+        "--output",
+        type=str,
+        required=False,
+        default=None,
+        help="Output filename prefix (e.g. 'gaming_phones'). Defaults to seed-based name."
+    )
+    return parser.parse_args()
 
 
 # ======================================
@@ -46,7 +71,7 @@ def to_native(obj):
 
 
 # ======================================
-# PYTRENDS
+# PYTRENDS SETUP
 # ======================================
 
 def make_pytrends():
@@ -56,7 +81,7 @@ pytrends = make_pytrends()
 
 
 # ======================================
-# AUTOSUGGEST
+# GOOGLE AUTOSUGGEST
 # ======================================
 
 def google_autosuggest(keyword):
@@ -67,7 +92,7 @@ def google_autosuggest(keyword):
         r.raise_for_status()
         return r.json()[1]
     except Exception as e:
-        print(f"  [autosuggest error] {keyword!r} -> {e}")
+        print(f"    [autosuggest error] {keyword!r} -> {e}")
         return []
 
 
@@ -78,43 +103,41 @@ def google_autosuggest(keyword):
 def collect_keywords(seed):
     keywords = set()
     visited  = set()
+    base     = seed.split()[0]
 
-    prefixes = [
-        seed,
+    question_prefixes = [
         f"how to {seed}", f"what is {seed}", f"why {seed}",
         f"best {seed}", f"how does {seed} work",
         f"{seed} for beginners", f"{seed} tips",
         f"{seed} guide", f"{seed} tutorial",
     ]
 
-    print(f"Collecting keywords for: '{seed}'")
+    print(f"\nCollecting keywords for: '{seed}'\n")
 
-    for term in prefixes:
+    for term in [seed] + question_prefixes:
         if len(keywords) >= TARGET_KEYWORDS:
             break
         if term in visited:
             continue
         visited.add(term)
-        suggestions = google_autosuggest(term)
+
         new = 0
-        for s in suggestions:
+        for s in google_autosuggest(term):
             s = s.strip().lower()
-            # filter: seed word must appear in suggestion
-            if s and s not in keywords and s != seed and seed.split()[0] in s:
+            if s and s not in keywords and s != seed and base in s:
                 keywords.add(s)
                 new += 1
                 if len(keywords) >= TARGET_KEYWORDS:
                     break
-        print(f"  BFS '{term}' -> +{new} (total: {len(keywords)})")
+
+        print(f"  BFS '{term}' -> +{new}  (total: {len(keywords)})")
         time.sleep(REQUEST_DELAY)
 
-    base = seed.split()[0]
     for letter in "abcdefghijklmnopqrstuvwxyz":
         if len(keywords) >= TARGET_KEYWORDS:
             break
-        suggestions = google_autosuggest(f"{base} {letter}")
         new = 0
-        for s in suggestions:
+        for s in google_autosuggest(f"{base} {letter}"):
             s = s.strip().lower()
             if s and s not in keywords and base in s:
                 keywords.add(s)
@@ -122,16 +145,16 @@ def collect_keywords(seed):
                 if len(keywords) >= TARGET_KEYWORDS:
                     break
         if new:
-            print(f"  Alpha '{base} {letter}' -> +{new} (total: {len(keywords)})")
+            print(f"  Alpha '{base} {letter}' -> +{new}  (total: {len(keywords)})")
         time.sleep(REQUEST_DELAY)
 
     result = list(keywords)[:TARGET_KEYWORDS]
-    print(f"Total collected: {len(result)}")
+    print(f"\nTotal keywords collected: {len(result)}")
     return result
 
 
 # ======================================
-# TRENDS BATCH
+# GOOGLE TRENDS (batch + exponential backoff)
 # ======================================
 
 def fetch_trends_batch(batch, attempt=1):
@@ -141,6 +164,7 @@ def fetch_trends_batch(batch, attempt=1):
     try:
         pytrends.build_payload(batch, timeframe=TREND_TIMEFRAME, geo="")
         data = pytrends.interest_over_time()
+
         if data.empty:
             return empty
 
@@ -167,30 +191,30 @@ def fetch_trends_batch(batch, attempt=1):
             else:                status = "stable"
 
             result[kw] = {"demand": demand, "momentum": momentum, "trend_status": status}
+
         return result
 
     except Exception as e:
-        err = str(e)
-        if "429" in err or "Too Many Requests" in err.lower():
+        if "429" in str(e) or "Too Many Requests" in str(e):
             if attempt > MAX_RETRIES:
-                print(f"  [trends] Blocked after {MAX_RETRIES} retries. Skipping batch.")
+                print(f"\n    [trends] Blocked after {MAX_RETRIES} retries -- skipping batch.")
                 return empty
             wait = BACKOFF_BASE * (2 ** (attempt - 1)) + random.uniform(0, 10)
-            print(f"  [trends] 429 hit. Retry {attempt}/{MAX_RETRIES} - waiting {wait:.0f}s...")
+            print(f"\n    [trends] 429 hit. Retry {attempt}/{MAX_RETRIES} -- waiting {wait:.0f}s ...")
             time.sleep(wait)
             pytrends = make_pytrends()
             return fetch_trends_batch(batch, attempt + 1)
-        print(f"  [trends error] {batch} -> {e}")
+
+        print(f"\n    [trends error] {batch} -> {e}")
         return empty
 
 
 # ======================================
-# SCORING
+# BOOM SCORE
 # ======================================
 
 def boom_score(demand, momentum, word_count):
-    momentum_capped = max(-50.0, min(50.0, momentum))
-    return round(demand * 0.55 + momentum_capped * 0.30 + word_count * 3.0, 2)
+    return round(demand * 0.55 + max(-50.0, min(50.0, momentum)) * 0.30 + word_count * 3.0, 2)
 
 def grade(score):
     if score >= 70: return "A+"
@@ -209,62 +233,113 @@ def analyze(seed):
     total    = len(keywords)
     batches  = [keywords[i:i+TRENDS_BATCH] for i in range(0, total, TRENDS_BATCH)]
 
-    print(f"\nScoring {total} keywords in {len(batches)} batches...")
+    print(f"\nScoring {total} keywords in {len(batches)} batches (~{len(batches)*TRENDS_DELAY//60}-{len(batches)*TRENDS_DELAY//60+2} min)\n")
+
     results = []
     done    = 0
 
     for batch_num, batch in enumerate(batches, 1):
-        td_map = fetch_trends_batch(batch)
-        for kw in batch:
-            td    = td_map[kw]
+        for kw, td in fetch_trends_batch(batch).items():
             wc    = len(kw.split())
             score = boom_score(td["demand"], td["momentum"], wc)
             done += 1
             record = {
-                "keyword"        : kw,
-                "word_count"     : wc,
-                "trend_demand"   : td["demand"],
-                "trend_momentum" : td["momentum"],
-                "trend_status"   : td["trend_status"],
-                "boom_score"     : score,
-                "grade"          : grade(score),
+                "keyword": kw, "word_count": wc,
+                "trend_demand": td["demand"], "trend_momentum": td["momentum"],
+                "trend_status": td["trend_status"],
+                "boom_score": score, "grade": grade(score),
             }
             results.append(record)
-            print(f"  [{done:>3}/{total}] score={score:>6.1f} ({record['grade']})  demand={td['demand']:>5.1f}  {td['trend_status']:<14}  {kw}")
+            filled = int((done / total) * 20)
+            print(
+                f"  [{'█'*filled}{'░'*(20-filled)}] {done:>3}/{total}  "
+                f"score={score:>6.1f} ({record['grade']})  "
+                f"demand={td['demand']:>5.1f}  "
+                f"trend={td['trend_status']:<14}  {kw}"
+            )
+
+        pd.DataFrame(results).to_csv("keyword_progress.csv", index=False)
+        with open("keyword_progress.json", "w") as f:
+            json.dump(to_native(results), f, indent=2)
 
         if batch_num < len(batches):
             time.sleep(TRENDS_DELAY + random.uniform(-3, 5))
 
-    df = pd.DataFrame(results)
-    df = df.sort_values(by="boom_score", ascending=False).reset_index(drop=True)
+    df = pd.DataFrame(results).sort_values("boom_score", ascending=False).reset_index(drop=True)
     df["rank"] = range(1, len(df) + 1)
     return df
 
 
 # ======================================
-# MAIN (CLI)
+# SAVE RESULTS
 # ======================================
 
-def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--seed",   required=True, help="Seed keyword")
-    parser.add_argument("--output", required=True, help="Output JSON file path")
-    args = parser.parse_args()
+def save(seed, df, output_prefix=None):
+    name = output_prefix if output_prefix else seed.replace(" ", "_").lower()
+    csv_file  = f"{name}_keywords.csv"
+    json_file = f"{name}_keywords.json"
 
-    df = analyze(args.seed)
+    df.to_csv(csv_file, index=False)
+    with open(json_file, "w", encoding="utf-8") as f:
+        json.dump(to_native(df.to_dict("records")), f, indent=2, ensure_ascii=False)
 
-    output = {
-        "seed"    : args.seed,
-        "total"   : len(df),
-        "keywords": to_native(df.to_dict("records"))
-    }
-
-    with open(args.output, "w", encoding="utf-8") as f:
-        json.dump(output, f, indent=2, ensure_ascii=False)
-
-    print(f"\nResults saved to {args.output}")
-    print(f"Top keyword: {df.iloc[0]['keyword']} (score: {df.iloc[0]['boom_score']})")
+    print(f"\nSaved: {csv_file}  |  {json_file}")
+    return csv_file, json_file
 
 
-if __name__ == "__main__":
-    main()
+# ======================================
+# PRINT SUMMARY
+# ======================================
+
+def print_summary(seed, df):
+    print("\n" + "=" * 72)
+    print(f"  TOP {OUTPUT_TOP} BOOM KEYWORDS FOR: '{seed}'")
+    print("=" * 72)
+    print(f"  {'#':<4} {'GRD':<5} {'SCORE':<8} {'DEMAND':<8} {'TREND':<15} KEYWORD")
+    print("  " + "-" * 68)
+    for _, row in df.head(OUTPUT_TOP).iterrows():
+        print(f"  {int(row['rank']):<4} {row['grade']:<5} {row['boom_score']:<8.1f} {row['trend_demand']:<8.1f} {row['trend_status']:<15} {row['keyword']}")
+    print("=" * 72)
+
+    grade_counts = df["grade"].value_counts()
+    print("\n  Grade breakdown:")
+    for g in ["A+", "A", "B", "C", "D"]:
+        count = grade_counts.get(g, 0)
+        print(f"    {g}  {'#'*count:<40} {count}")
+
+    rising = df[df["trend_status"].isin(["rising", "rising_fast"])].head(5)
+    if not rising.empty:
+        print("\n  Rising trends -- write these NOW:")
+        for _, row in rising.iterrows():
+            print(f"    [{row['trend_status']}]  {row['keyword']}")
+    print()
+
+
+# ======================================
+# MAIN
+# ======================================
+
+def run():
+    args = parse_args()
+
+    if args.seed:
+        # called from GitHub Actions or CLI with --seed flag
+        seed = args.seed.strip()
+        print(f"\n[CI mode] Seed keyword: '{seed}'")
+    else:
+        # interactive local mode
+        print("\n" + "=" * 60)
+        print("  BLOG KEYWORD ENGINE  --  Free, Honest, Actually Works")
+        print("=" * 60 + "\n")
+        seed = input("Enter main keyword: ").strip()
+
+    if not seed:
+        print("No keyword provided. Exiting.")
+        sys.exit(1)
+
+    df = analyze(seed)
+    save(seed, df, output_prefix=args.output)
+    print_summary(seed, df)
+
+
+run()
