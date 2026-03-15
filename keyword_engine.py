@@ -13,13 +13,13 @@ from pytrends.request import TrendReq
 # CONFIGURATION
 # ======================================
 
-TARGET_KEYWORDS  = 80
+TARGET_KEYWORDS  = 120
 REQUEST_DELAY    = 1.2
 TREND_TIMEFRAME  = "today 12-m"
 OUTPUT_TOP       = 20
 TRENDS_BATCH     = 5
-TRENDS_DELAY     = 20
-BACKOFF_BASE     = 60
+TRENDS_DELAY     = 5
+BACKOFF_BASE     = 20
 MAX_RETRIES      = 4
 
 HEADERS = {
