@@ -1,0 +1,100 @@
+name: Keyword Research
+
+on:
+  # Apps Script calls this via repository_dispatch
+  repository_dispatch:
+    types: [run_keyword_research]
+
+  # also allow manual trigger from GitHub UI for testing
+  workflow_dispatch:
+    inputs:
+      keyword:
+        description: "Seed keyword to research"
+        required: true
+        default: "gaming phones"
+      callback_url:
+        description: "Apps Script webhook URL to POST results back"
+        required: false
+
+jobs:
+  research:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run keyword engine
+        env:
+          # keyword comes from Apps Script payload OR manual input
+          SEED_KEYWORD: ${{ github.event.client_payload.keyword || github.event.inputs.keyword }}
+        run: |
+          python keyword_engine.py "$SEED_KEYWORD"
+
+      - name: Read results JSON
+        id: read_results
+        run: |
+          # keyword_engine.py saves  <seed>_keywords.json
+          # find the file regardless of what the seed was
+          RESULTS_FILE=$(ls *_keywords.json | head -1)
+          echo "Found: $RESULTS_FILE"
+
+          # compact the JSON into a single line for the env var
+          RESULTS=$(python -c "
+          import json, sys
+          with open('$RESULTS_FILE') as f:
+              data = json.load(f)
+          # send top 20 only to keep payload small
+          top20 = data[:20]
+          print(json.dumps(top20, ensure_ascii=False))
+          ")
+
+          # write to GITHUB_OUTPUT (handles multiline safely)
+          echo "results<<EOF" >> $GITHUB_OUTPUT
+          echo "$RESULTS"    >> $GITHUB_OUTPUT
+          echo "EOF"         >> $GITHUB_OUTPUT
+
+      - name: POST results back to Apps Script
+        env:
+          CALLBACK_URL: ${{ github.event.client_payload.callback_url || github.event.inputs.callback_url }}
+          SEED_KEYWORD: ${{ github.event.client_payload.keyword || github.event.inputs.keyword }}
+          RESULTS: ${{ steps.read_results.outputs.results }}
+        run: |
+          if [ -z "$CALLBACK_URL" ]; then
+            echo "No callback URL provided — skipping POST"
+            exit 0
+          fi
+
+          python - <<'PYEOF'
+          import os, json, requests
+
+          url     = os.environ["CALLBACK_URL"]
+          keyword = os.environ["SEED_KEYWORD"]
+          results = json.loads(os.environ["RESULTS"])
+
+          payload = {
+            "status":  "success",
+            "keyword": keyword,
+            "results": results
+          }
+
+          r = requests.post(url, json=payload, timeout=30)
+          print(f"Callback response: {r.status_code}")
+          print(r.text[:500])
+          PYEOF
+
+      - name: Upload full results as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: keyword-results
+          path: "*_keywords.*"
+          retention-days: 30
