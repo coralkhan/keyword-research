@@ -11,7 +11,7 @@ on:
         required: true
         default: "gaming phones"
       callback_url:
-        description: "Apps Script webhook URL to POST results back"
+        description: "Apps Script Web App URL to POST results back"
         required: false
 
 jobs:
@@ -35,54 +35,88 @@ jobs:
         run: |
           SEED="${{ github.event.client_payload.keyword || github.event.inputs.keyword }}"
           OUTPUT=$(echo "$SEED" | tr ' ' '_' | tr '[:upper:]' '[:lower:]')
-          echo "SEED=$SEED" >> $GITHUB_ENV
+          echo "SEED=$SEED"     >> $GITHUB_ENV
           echo "OUTPUT=$OUTPUT" >> $GITHUB_ENV
           python keyword_engine.py --seed "$SEED" --output "$OUTPUT"
 
-      - name: Read results and send callback
+      # -------------------------------------------------------
+      # THIS IS THE STEP THAT WAKES UP APPS SCRIPT
+      # Reads the JSON results and POSTs them to the webhook URL
+      # -------------------------------------------------------
+      - name: POST results back to Apps Script
+        env:
+          CALLBACK_URL: ${{ github.event.client_payload.callback_url || github.event.inputs.callback_url }}
+          RUN_ID:       ${{ github.event.client_payload.run_id || '' }}
         run: |
           python - <<'PYEOF'
-          import os, json, requests, glob
+          import os, json, glob, requests, sys
 
-          seed   = os.environ.get("SEED", "")
-          output = os.environ.get("OUTPUT", "")
+          callback_url = os.environ.get("CALLBACK_URL", "").strip()
+          seed         = os.environ.get("SEED", "").strip()
+          run_id       = os.environ.get("RUN_ID", "").strip()
+          output       = os.environ.get("OUTPUT", "").strip()
 
-          # find the output JSON file
-          candidates = glob.glob(f"{output}_keywords.json") or glob.glob("*_keywords.json")
+          # ---- find the results file ----
+          candidates = glob.glob(f"{output}_keywords.json")
           if not candidates:
-              print("ERROR: No results JSON file found")
-              raise SystemExit(1)
+              candidates = glob.glob("*_keywords.json")
+          if not candidates:
+              print("ERROR: No results JSON file found. Cannot callback.")
+              sys.exit(1)
 
           results_file = candidates[0]
-          print(f"Reading results from: {results_file}")
+          print(f"Reading: {results_file}")
 
           with open(results_file, encoding="utf-8") as f:
-              data = json.load(f)
+              all_results = json.load(f)
 
-          # send top 20 only to keep payload small
-          top20 = data[:20]
+          print(f"Total keywords: {len(all_results)}")
+          print(f"Top 3 preview:")
+          for k in all_results[:3]:
+              print(f"  {k['rank']}. {k['keyword']} | score={k['boom_score']} | {k['trend_status']}")
 
-          callback_url = (
-              "${{ github.event.client_payload.callback_url }}"
-              or "${{ github.event.inputs.callback_url }}"
-          ).strip()
-
+          # ---- POST to Apps Script ----
           if not callback_url:
-              print("No callback URL provided -- skipping POST")
-              print(f"Top 3 results preview:")
-              for k in top20[:3]:
-                  print(f"  {k['rank']}. {k['keyword']} | score={k['boom_score']} | {k['trend_status']}")
-          else:
-              payload = {"status": "success", "keyword": seed, "results": top20}
-              r = requests.post(callback_url, json=payload, timeout=30)
+              print("No callback URL provided — skipping POST.")
+              print("To enable: pass callback_url in the workflow_dispatch input or repository_dispatch payload.")
+              sys.exit(0)
+
+          payload = {
+              "status":   "success",
+              "run_id":   run_id,
+              "keyword":  seed,
+              "results":  all_results,   # send ALL results, not just top 20
+          }
+
+          print(f"POSTing {len(all_results)} results to Apps Script...")
+          print(f"URL: {callback_url[:60]}...")
+
+          try:
+              r = requests.post(
+                  callback_url,
+                  json=payload,
+                  timeout=30,
+                  headers={"Content-Type": "application/json"}
+              )
               print(f"Callback response: {r.status_code}")
-              if r.status_code != 200:
-                  print(f"Callback body: {r.text[:300]}")
+              print(f"Response body: {r.text[:300]}")
+
+              if r.status_code == 200:
+                  print("SUCCESS — Apps Script received the results and will now write the blog.")
+              else:
+                  print(f"WARNING — unexpected status code: {r.status_code}")
+
+          except requests.exceptions.Timeout:
+              print("Timeout on callback POST — Apps Script may still have received it.")
+          except Exception as e:
+              print(f"Callback error: {e}")
+              sys.exit(1)
 
           PYEOF
 
-      - name: Upload full results as artifact
+      - name: Upload results as artifact
         uses: actions/upload-artifact@v4
+        if: always()
         with:
           name: keyword-results-${{ github.run_number }}
           path: "*_keywords.*"
