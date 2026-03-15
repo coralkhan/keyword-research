@@ -13,13 +13,13 @@ from pytrends.request import TrendReq
 # CONFIGURATION
 # ======================================
 
-TARGET_KEYWORDS  = 120
+TARGET_KEYWORDS  = 80
 REQUEST_DELAY    = 1.2
 TREND_TIMEFRAME  = "today 12-m"
 OUTPUT_TOP       = 20
 TRENDS_BATCH     = 5
-TRENDS_DELAY     = 5
-BACKOFF_BASE     = 20
+TRENDS_DELAY     = 20
+BACKOFF_BASE     = 60
 MAX_RETRIES      = 4
 
 HEADERS = {
@@ -37,21 +37,45 @@ HEADERS = {
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Blog Keyword Engine")
-    parser.add_argument(
-        "--seed",
-        type=str,
-        required=False,
-        default=None,
-        help="Seed keyword to research (e.g. 'gaming phones')"
-    )
-    parser.add_argument(
-        "--output",
-        type=str,
-        required=False,
-        default=None,
-        help="Output filename prefix (e.g. 'gaming_phones'). Defaults to seed-based name."
-    )
+    parser.add_argument("--seed",   type=str, required=False, default=None)
+    parser.add_argument("--output", type=str, required=False, default=None)
     return parser.parse_args()
+
+
+# ======================================
+# SEED VALIDATION
+# Catches bad seeds like "Gaming Phones Under" before wasting time
+# ======================================
+
+def validate_seed(seed):
+    """
+    Returns (is_valid, reason).
+    A seed is invalid if:
+    - It's empty
+    - It ends with a preposition/incomplete word (suggests Groq truncated it)
+    - Autosuggest returns 0 results for the raw seed
+    """
+    if not seed or len(seed.strip()) == 0:
+        return False, "empty seed"
+
+    seed = seed.strip()
+
+    # seeds ending with these words are almost always incomplete phrases
+    BAD_ENDINGS = [
+        "under", "for", "with", "and", "or", "the", "a", "an",
+        "in", "on", "at", "to", "of", "by", "from", "into",
+        "about", "best", "how", "what", "why", "which"
+    ]
+    last_word = seed.split()[-1].lower()
+    if last_word in BAD_ENDINGS:
+        return False, f"seed ends with incomplete word '{last_word}'"
+
+    # quick autosuggest check — if Google returns nothing, the seed is useless
+    suggestions = google_autosuggest(seed)
+    if len(suggestions) == 0:
+        return False, "autosuggest returned 0 results for this seed"
+
+    return True, "ok"
 
 
 # ======================================
@@ -103,7 +127,8 @@ def google_autosuggest(keyword):
 def collect_keywords(seed):
     keywords = set()
     visited  = set()
-    base     = seed.split()[0]
+    # use ALL seed words for filtering — prevents off-topic drift
+    seed_words = seed.lower().split()
 
     question_prefixes = [
         f"how to {seed}", f"what is {seed}", f"why {seed}",
@@ -124,22 +149,26 @@ def collect_keywords(seed):
         new = 0
         for s in google_autosuggest(term):
             s = s.strip().lower()
-            if s and s not in keywords and s != seed and base in s:
-                keywords.add(s)
-                new += 1
-                if len(keywords) >= TARGET_KEYWORDS:
-                    break
+            # all seed words must appear in the suggestion
+            if s and s not in keywords and s != seed.lower():
+                if all(w in s for w in seed_words):
+                    keywords.add(s)
+                    new += 1
+                    if len(keywords) >= TARGET_KEYWORDS:
+                        break
 
         print(f"  BFS '{term}' -> +{new}  (total: {len(keywords)})")
         time.sleep(REQUEST_DELAY)
 
+    # alphabet sweep using first word only
+    base = seed.split()[0].lower()
     for letter in "abcdefghijklmnopqrstuvwxyz":
         if len(keywords) >= TARGET_KEYWORDS:
             break
         new = 0
         for s in google_autosuggest(f"{base} {letter}"):
             s = s.strip().lower()
-            if s and s not in keywords and base in s:
+            if s and s not in keywords and all(w in s for w in seed_words):
                 keywords.add(s)
                 new += 1
                 if len(keywords) >= TARGET_KEYWORDS:
@@ -231,8 +260,16 @@ def grade(score):
 def analyze(seed):
     keywords = collect_keywords(seed)
     total    = len(keywords)
-    batches  = [keywords[i:i+TRENDS_BATCH] for i in range(0, total, TRENDS_BATCH)]
 
+    # guard: if no keywords collected, exit cleanly with clear message
+    if total == 0:
+        print("\nERROR: No keywords collected for this seed.")
+        print("This usually means the seed keyword is too specific, incomplete,")
+        print("or Google Autosuggest has no data for it.")
+        print(f"Seed was: '{seed}'")
+        sys.exit(2)   # exit code 2 = bad seed (not a crash)
+
+    batches = [keywords[i:i+TRENDS_BATCH] for i in range(0, total, TRENDS_BATCH)]
     print(f"\nScoring {total} keywords in {len(batches)} batches (~{len(batches)*TRENDS_DELAY//60}-{len(batches)*TRENDS_DELAY//60+2} min)\n")
 
     results = []
@@ -275,14 +312,12 @@ def analyze(seed):
 # ======================================
 
 def save(seed, df, output_prefix=None):
-    name = output_prefix if output_prefix else seed.replace(" ", "_").lower()
+    name      = output_prefix if output_prefix else seed.replace(" ", "_").lower()
     csv_file  = f"{name}_keywords.csv"
     json_file = f"{name}_keywords.json"
-
     df.to_csv(csv_file, index=False)
     with open(json_file, "w", encoding="utf-8") as f:
         json.dump(to_native(df.to_dict("records")), f, indent=2, ensure_ascii=False)
-
     print(f"\nSaved: {csv_file}  |  {json_file}")
     return csv_file, json_file
 
@@ -298,7 +333,8 @@ def print_summary(seed, df):
     print(f"  {'#':<4} {'GRD':<5} {'SCORE':<8} {'DEMAND':<8} {'TREND':<15} KEYWORD")
     print("  " + "-" * 68)
     for _, row in df.head(OUTPUT_TOP).iterrows():
-        print(f"  {int(row['rank']):<4} {row['grade']:<5} {row['boom_score']:<8.1f} {row['trend_demand']:<8.1f} {row['trend_status']:<15} {row['keyword']}")
+        print(f"  {int(row['rank']):<4} {row['grade']:<5} {row['boom_score']:<8.1f} "
+              f"{row['trend_demand']:<8.1f} {row['trend_status']:<15} {row['keyword']}")
     print("=" * 72)
 
     grade_counts = df["grade"].value_counts()
@@ -323,11 +359,9 @@ def run():
     args = parse_args()
 
     if args.seed:
-        # called from GitHub Actions or CLI with --seed flag
         seed = args.seed.strip()
         print(f"\n[CI mode] Seed keyword: '{seed}'")
     else:
-        # interactive local mode
         print("\n" + "=" * 60)
         print("  BLOG KEYWORD ENGINE  --  Free, Honest, Actually Works")
         print("=" * 60 + "\n")
@@ -336,6 +370,14 @@ def run():
     if not seed:
         print("No keyword provided. Exiting.")
         sys.exit(1)
+
+    # validate seed before doing any work
+    is_valid, reason = validate_seed(seed)
+    if not is_valid:
+        print(f"\nERROR: Invalid seed keyword '{seed}'")
+        print(f"Reason: {reason}")
+        print("The Apps Script should retry with a better seed.")
+        sys.exit(2)   # exit code 2 = bad seed
 
     df = analyze(seed)
     save(seed, df, output_prefix=args.output)
