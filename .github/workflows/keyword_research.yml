@@ -32,17 +32,28 @@ jobs:
         run: pip install -r requirements.txt
 
       - name: Run keyword engine
+        id: run_engine
         run: |
           SEED="${{ github.event.client_payload.keyword || github.event.inputs.keyword }}"
           OUTPUT=$(echo "$SEED" | tr ' ' '_' | tr '[:upper:]' '[:lower:]')
           echo "SEED=$SEED"     >> $GITHUB_ENV
           echo "OUTPUT=$OUTPUT" >> $GITHUB_ENV
-          python keyword_engine.py --seed "$SEED" --output "$OUTPUT"
 
-      # -------------------------------------------------------
-      # THIS IS THE STEP THAT WAKES UP APPS SCRIPT
-      # Reads the JSON results and POSTs them to the webhook URL
-      # -------------------------------------------------------
+          # run the engine — capture exit code without failing the workflow
+          python keyword_engine.py --seed "$SEED" --output "$OUTPUT"
+          EXIT_CODE=$?
+          echo "EXIT_CODE=$EXIT_CODE" >> $GITHUB_ENV
+
+          # exit code 2 = bad seed (not a crash) — handle gracefully
+          if [ $EXIT_CODE -eq 2 ]; then
+            echo "BAD_SEED=true" >> $GITHUB_ENV
+            echo "::warning::Seed '$SEED' was rejected by validation. Apps Script will be notified."
+            exit 0   # don't fail the workflow, just notify back
+          fi
+
+          exit $EXIT_CODE
+        continue-on-error: false
+
       - name: POST results back to Apps Script
         env:
           CALLBACK_URL: ${{ github.event.client_payload.callback_url || github.event.inputs.callback_url }}
@@ -55,62 +66,65 @@ jobs:
           seed         = os.environ.get("SEED", "").strip()
           run_id       = os.environ.get("RUN_ID", "").strip()
           output       = os.environ.get("OUTPUT", "").strip()
+          bad_seed     = os.environ.get("BAD_SEED", "").strip() == "true"
 
-          # ---- find the results file ----
-          candidates = glob.glob(f"{output}_keywords.json")
+          if not callback_url:
+              print("No callback URL — skipping POST.")
+              sys.exit(0)
+
+          # if seed was bad, notify Apps Script so it can retry
+          if bad_seed:
+              payload = {
+                  "status":  "bad_seed",
+                  "run_id":  run_id,
+                  "keyword": seed,
+                  "error":   "Seed keyword was rejected: incomplete or returns no autosuggest results",
+                  "results": [],
+              }
+              print(f"Notifying Apps Script of bad seed: {seed}")
+              r = requests.post(callback_url, json=payload, timeout=30,
+                                headers={"Content-Type": "application/json"})
+              print(f"Callback response: {r.status_code}")
+              sys.exit(0)
+
+          # normal success path — find and send results
+          candidates = glob.glob(f"{output}_keywords.json") or glob.glob("*_keywords.json")
           if not candidates:
-              candidates = glob.glob("*_keywords.json")
-          if not candidates:
-              print("ERROR: No results JSON file found. Cannot callback.")
+              print("ERROR: No results JSON file found.")
+              payload = {
+                  "status":  "error",
+                  "run_id":  run_id,
+                  "keyword": seed,
+                  "error":   "No results file generated",
+                  "results": [],
+              }
+              requests.post(callback_url, json=payload, timeout=30,
+                            headers={"Content-Type": "application/json"})
               sys.exit(1)
 
-          results_file = candidates[0]
-          print(f"Reading: {results_file}")
-
-          with open(results_file, encoding="utf-8") as f:
+          with open(candidates[0], encoding="utf-8") as f:
               all_results = json.load(f)
 
-          print(f"Total keywords: {len(all_results)}")
-          print(f"Top 3 preview:")
+          print(f"Sending {len(all_results)} results to Apps Script...")
+          print("Top 3 preview:")
           for k in all_results[:3]:
               print(f"  {k['rank']}. {k['keyword']} | score={k['boom_score']} | {k['trend_status']}")
 
-          # ---- POST to Apps Script ----
-          if not callback_url:
-              print("No callback URL provided — skipping POST.")
-              print("To enable: pass callback_url in the workflow_dispatch input or repository_dispatch payload.")
-              sys.exit(0)
-
           payload = {
-              "status":   "success",
-              "run_id":   run_id,
-              "keyword":  seed,
-              "results":  all_results,   # send ALL results, not just top 20
+              "status":  "success",
+              "run_id":  run_id,
+              "keyword": seed,
+              "results": all_results,
           }
 
-          print(f"POSTing {len(all_results)} results to Apps Script...")
-          print(f"URL: {callback_url[:60]}...")
+          r = requests.post(callback_url, json=payload, timeout=30,
+                            headers={"Content-Type": "application/json"})
+          print(f"Callback response: {r.status_code}")
 
-          try:
-              r = requests.post(
-                  callback_url,
-                  json=payload,
-                  timeout=30,
-                  headers={"Content-Type": "application/json"}
-              )
-              print(f"Callback response: {r.status_code}")
-              print(f"Response body: {r.text[:300]}")
-
-              if r.status_code == 200:
-                  print("SUCCESS — Apps Script received the results and will now write the blog.")
-              else:
-                  print(f"WARNING — unexpected status code: {r.status_code}")
-
-          except requests.exceptions.Timeout:
-              print("Timeout on callback POST — Apps Script may still have received it.")
-          except Exception as e:
-              print(f"Callback error: {e}")
-              sys.exit(1)
+          if r.status_code == 200:
+              print("SUCCESS — Apps Script will now write the blog.")
+          else:
+              print(f"WARNING — unexpected status: {r.status_code} | {r.text[:200]}")
 
           PYEOF
 
